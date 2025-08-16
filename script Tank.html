@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tank Trouble – Bản web tối giản</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #0f172a; color: #e2e8f0; font-family: system-ui, Arial, sans-serif; }
+    #wrap { display: grid; place-items: center; gap: 12px; padding: 12px; }
+    canvas { background: #e5e7eb; border-radius: 12px; box-shadow: 0 10px 24px rgba(0,0,0,.35); touch-action: none; }
+    .hud { display:flex; gap:16px; align-items:center; justify-content:center; flex-wrap: wrap; }
+    .btn { background:#111827; color:#e5e7eb; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600; }
+    .btn:hover { background:#1f2937; }
+    .note { opacity:.85; font-size: 14px; line-height: 1.4; max-width: 920px; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div class="hud">
+      <button id="btnReset" class="btn">⟲ Reset trận</button>
+      <button id="btnMaze" class="btn">🧱 Maze mới</button>
+      <span id="score" style="font-weight:700"></span>
+    </div>
+    <canvas id="game" width="960" height="640"></canvas>
+    <div class="note">
+      <div><b>Điều khiển:</b> P1 = W/S tiến lùi, A/D xoay, <b>Space</b> bắn. | P2 = ↑/↓ tiến lùi, ←/→ xoay, <b>Enter</b> bắn.</div>
+      <div>Đạn nảy tối đa 3 lần. Tự trúng đạn cũng tính thua (có cả “tự sát” 😅).</div>
+    </div>
+  </div>
+
+  <script>
+  // ==== Utility ====
+  const TAU = Math.PI * 2;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rnd = (a, b) => Math.random() * (b - a) + a;
+
+  // ==== World setup ====
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // Maze settings
+  const CELL = 64; // grid size
+  const COLS = Math.floor(W / CELL);
+  const ROWS = Math.floor(H / CELL);
+  let walls = [];// each wall: {x,y,w,h}
+
+  function addWall(x,y,w,h){ walls.push({x,y,w,h}); }
+
+  // Generate a simple random orthogonal maze-like layout
+  function generateMaze() {
+    walls = [];
+    // border
+    addWall(0,0,W,16); addWall(0,H-16,W,16); addWall(0,0,16,H); addWall(W-16,0,16,H);
+    // inner blocks
+    for (let r=1;r<ROWS-1;r++){
+      for (let c=1;c<COLS-1;c++){
+        if (Math.random()<0.16) { // sparse blocks
+          const x=c*CELL+8, y=r*CELL+8, s=CELL-16;
+          addWall(x,y,s,16);
+          if (Math.random()<0.7) addWall(x,y+s-16,s,16);
+          if (Math.random()<0.5) addWall(x,y,16,s);
+          if (Math.random()<0.5) addWall(x+s-16,y,16,s);
+        }
+      }
+    }
+    // central obstacle
+    const cx = (COLS/2|0)*CELL - CELL/2; const cy = (ROWS/2|0)*CELL - CELL/2;
+    addWall(cx-32, cy-96, 16, 192); addWall(cx+16, cy-96, 16, 192);
+  }
+
+  // ==== Physics helpers (AABB vs circle) ====
+  function circleWallCollision(px,py, vx,vy, radius){
+    // sweep and reflect simplistic; step back if overlapping
+    for (const w of walls){
+      const nx = clamp(px, w.x, w.x + w.w);
+      const ny = clamp(py, w.y, w.y + w.h);
+      const dx = px - nx; const dy = py - ny; const d2 = dx*dx + dy*dy;
+      if (d2 < radius*radius){
+        // Determine which side collided more strongly and reflect
+        if (Math.abs(dx) > Math.abs(dy)) { vx = -vx; }
+        else { vy = -vy; }
+        // push out
+        const len = Math.sqrt(d2)||1; const ux = dx/len, uy = dy/len;
+        px = nx + ux*radius; py = ny + uy*radius;
+      }
+    }
+    return {px,py,vx,vy};
+  }
+
+  // ==== Entities ====
+  class Tank{
+    constructor(x,y, color){
+      this.x=x; this.y=y; this.a=0; this.color=color; this.speed=0; this.turn=0; this.cool=0; this.alive=true;
+      this.radius=18; this.maxSpeed=300; this.acc=240; this.drag=1; this.turnSpeed=2.8;
+      this.spawn={x,y};
+    }
+    reset(){ this.x=this.spawn.x; this.y=this.spawn.y; this.a=0; this.speed=0; this.alive=true; this.cool=0; }
+    input(up,down,left,right,fire){
+      const f = keys[up]-keys[down];
+      const t = keys[right]-keys[left];
+      this.speed += f*this.acc*dt;
+      this.speed = clamp(this.speed, -this.maxSpeed, this.maxSpeed);
+      this.a += t*this.turnSpeed*dt;
+      if (keys[fire] && this.cool<=0 && this.alive){ bullets.push(this.fire()); this.cool=0.35; }
+    }
+    fire(){
+      const bx = this.x + Math.cos(this.a)*26;
+      const by = this.y + Math.sin(this.a)*26;
+      const s = 420;
+      return new Bullet(bx,by, Math.cos(this.a)*s, Math.sin(this.a)*s, this);
+    }
+    update(){
+      if (!this.alive) return;
+      this.cool -= dt;
+      // integrate
+      this.x += Math.cos(this.a)*this.speed*dt;
+      this.y += Math.sin(this.a)*this.speed*dt;
+      this.speed *= this.drag;
+      // collide with walls
+      const res = circleWallCollision(this.x,this.y, Math.cos(this.a)*this.speed*dt, Math.sin(this.a)*this.speed*dt, this.radius);
+      this.x=res.px; this.y=res.py;
+    }
+    draw(){
+      ctx.save();
+      ctx.translate(this.x, this.y); ctx.rotate(this.a);
+      // body
+      ctx.fillStyle = this.color; ctx.strokeStyle = '#263238'; ctx.lineWidth = 3;
+      roundedRect(-22,-16,44,32,8, this.color);
+      // turret
+      roundedRect(-8,-10,20,20,6, '#111827');
+      ctx.fillStyle = '#111827'; ctx.fillRect(10,-5, 24,10);
+      ctx.restore();
+    }
+  }
+
+  class Bullet{
+    constructor(x,y,vx,vy, owner){ this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.r=6; this.bounces=3; this.owner=owner; this.life=5; }
+    update(){
+      this.life -= dt; if (this.life<=0) this.dead=true;
+      this.x += this.vx*dt; this.y += this.vy*dt;
+      const after = circleWallCollision(this.x,this.y,this.vx,this.vy,this.r);
+      if (after.vx !== this.vx || after.vy !== this.vy){
+        this.vx = after.vx; this.vy = after.vy; this.bounces--; if (this.bounces<0) this.dead=true;
+      }
+      this.x = after.px; this.y = after.py;
+      // hit tanks
+      for (const t of tanks){
+        if (!t.alive) continue;
+        const dx=this.x-t.x, dy=this.y-t.y; if (dx*dx+dy*dy < (t.radius+this.r)*(t.radius+this.r)){
+          if (t!==this.owner || this.life<4.8) { // allow self-kill
+            t.alive=false; this.dead=true; scoreKill(this.owner===t?null:this.owner);
+          }
+        }
+      }
+    }
+    draw(){ ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,TAU); ctx.fillStyle = '#0f766e'; ctx.fill(); ctx.strokeStyle='#134e4a'; ctx.stroke(); }
+  }
+
+  function roundedRect(x,y,w,h,r, fill){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth=2; ctx.stroke();
+  }
+
+  // ==== Game state ====
+  const tanks = [ new Tank(96, H-96, '#ef4444'), new Tank(W-96, 96, '#22c55e') ];
+  let bullets = [];
+  let last = performance.now();
+  let dt = 0;
+  let scores = [0,0];
+
+  function scoreKill(killer){
+    if (killer===tanks[0]) scores[0]++; else if (killer===tanks[1]) scores[1]++;
+    updateScore();
+    setTimeout(nextRound, 600);
+  }
+
+  function nextRound(){ bullets=[]; tanks.forEach(t=>t.reset()); }
+  function updateScore(){ document.getElementById('score').textContent = `Tỷ số — Đỏ ${scores[0]} : ${scores[1]} Xanh`; }
+
+  // ==== Input ====
+  const keys = {};
+  addEventListener('keydown', e=>{ keys[e.code]=1; if (["Space","Enter"].includes(e.code)) e.preventDefault(); });
+  addEventListener('keyup', e=>{ keys[e.code]=0; });
+
+  document.getElementById('btnReset').onclick = ()=>{ scores=[0,0]; updateScore(); nextRound(); };
+  document.getElementById('btnMaze').onclick = ()=>{ generateMaze(); nextRound(); };
+
+  // ==== Main loop ====
+  function loop(t){
+    dt = Math.min(1/30, (t-last)/1000); last=t;
+
+    // input
+    tanks[0].input('KeyW','KeyS','KeyA','KeyD','Space');
+    tanks[1].input('ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter');
+
+    // update
+    tanks.forEach(t=>t.update());
+    bullets.forEach(b=>b.update());
+    bullets = bullets.filter(b=>!b.dead);
+
+    // render
+    ctx.clearRect(0,0,W,H);
+    // grid background
+    for (let r=0;r<ROWS;r++) for (let c=0;c<COLS;c++){
+      if ((r+c)%2===0){ ctx.fillStyle = '#e5e7eb'; } else { ctx.fillStyle = '#d1d5db'; }
+      ctx.fillRect(c*CELL, r*CELL, CELL, CELL);
+    }
+    ctx.fillStyle = '#6b7280';
+    walls.forEach(w=>{ ctx.fillStyle = '#9ca3af'; ctx.fillRect(w.x,w.y,w.w,w.h); ctx.strokeStyle='#4b5563'; ctx.lineWidth=4; ctx.strokeRect(w.x+1.5,w.y+1.5,w.w-3,w.h-3);});
+
+    bullets.forEach(b=>b.draw());
+    tanks.forEach(t=>t.draw());
+
+    requestAnimationFrame(loop);
+  }
+
+  // init
+  generateMaze();
+  updateScore();
+  requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
